@@ -1,11 +1,20 @@
 import dataclasses
 import json
 import math
+import os
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file
+
+try:
+    import triton
+    import triton.language as tl
+
+    _triton_available = True
+except ImportError:
+    _triton_available = False
 
 
 @dataclasses.dataclass
@@ -31,6 +40,54 @@ class ModelConfig:
     vocab_size: int
 
 
+if _triton_available:
+
+    @triton.jit
+    def _rmsnorm_forward_kernel(x_ptr, w_ptr, o_ptr, eps, stride, hidden_size, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(0)
+        offsets = pid * stride + tl.arange(0, BLOCK_SIZE)
+        mask = tl.arange(0, BLOCK_SIZE) < hidden_size
+
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + tl.arange(0, BLOCK_SIZE), mask=mask, other=0.0).to(tl.float32)
+
+        mean = tl.sum(x * x, axis=0) / hidden_size
+        inv_rms = tl.rsqrt(mean + eps)
+
+        y = x * inv_rms * w
+        tl.store(o_ptr + offsets, y, mask=mask)
+
+
+def _rms_norm_triton(input, weight, eps):
+    hidden_size = input.shape[-1]
+    x_2d = input.view(-1, hidden_size)
+
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+
+    output = torch.empty_like(x_2d)
+
+    # Bound block size to avoid register pressure.
+    block_size = int(min(4096, triton.next_power_of_2(hidden_size))) if _triton_available else hidden_size
+
+    grid = (x_2d.shape[0],)
+
+    _rmsnorm_forward_kernel[grid](
+        x_2d,
+        weight,
+        output,
+        eps,
+        x_2d.stride(0),
+        hidden_size,
+        BLOCK_SIZE=block_size,
+    )
+
+    return output.view_as(input)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps):
         super().__init__()
@@ -40,6 +97,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, input):
+        if _triton_available and input.is_cuda:
+            return _rms_norm_triton(input, self.weight, self.eps)
+
         return (
             input
             * torch.rsqrt(input.pow(2).mean(dim=-1, keepdim=True) + self.eps)
@@ -75,6 +135,169 @@ def apply_rotary_position_embedding(input, sin_table, cos_table):
     return torch.cat((input_0_rotated, input_1_rotated), dim=-1)
 
 
+if _triton_available:
+
+    @triton.jit
+    def _flash_attn_fwd(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        sm_scale,
+        stride_qz,
+        stride_qh,
+        stride_qm,
+        stride_qk,
+        stride_kz,
+        stride_kh,
+        stride_km,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vm,
+        stride_vk,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_ok,
+        n_heads,
+        seqlen,
+        head_dim,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_DMODEL: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_bh = tl.program_id(1)
+
+        batch_id = pid_bh // n_heads
+        head_id = pid_bh % n_heads
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_DMODEL)
+
+        row_mask = offs_m < seqlen
+
+        q_ptrs = (
+            q_ptr
+            + batch_id * stride_qz
+            + head_id * stride_qh
+            + offs_m[:, None] * stride_qm
+            + offs_k[None, :] * stride_qk
+        )
+        q_mask = (offs_m[:, None] < seqlen) & (offs_k[None, :] < head_dim)
+        q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
+
+        m_i = tl.where(row_mask, float("-inf"), 0.0)
+        l_i = tl.where(row_mask, 0.0, 1.0)
+        acc = tl.zeros((BLOCK_M, BLOCK_DMODEL), dtype=tl.float32)
+
+        n_blocks = tl.cdiv(seqlen, BLOCK_N)
+        for n in range(0, n_blocks):
+            start_n = n * BLOCK_N
+            k_ptrs = (
+                k_ptr
+                + batch_id * stride_kz
+                + head_id * stride_kh
+                + (start_n + offs_n)[None, :] * stride_km
+                + offs_k[:, None] * stride_kk
+            )
+            v_ptrs = (
+                v_ptr
+                + batch_id * stride_vz
+                + head_id * stride_vh
+                + (start_n + offs_n)[:, None] * stride_vm
+                + offs_k[None, :] * stride_vk
+            )
+
+            kv_mask = ((start_n + offs_n)[None, :] < seqlen) & (offs_k[:, None] < head_dim)
+
+            k = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+            v = tl.load(v_ptrs, mask=kv_mask.T, other=0.0).to(tl.float32)
+
+            qk = tl.dot(q, k) * sm_scale
+
+            valid_k = (start_n + offs_n)[None, :] < seqlen
+            causal_mask = valid_k & ((start_n + offs_n)[None, :] <= offs_m[:, None])
+            qk = tl.where(causal_mask & row_mask[:, None], qk, float("-inf"))
+
+            m_ij = tl.max(qk, axis=1)
+            m_ij_is_inf = m_ij == float("-inf")
+
+            p = tl.where(m_ij_is_inf[:, None], 0.0, tl.exp(qk - m_ij[:, None]))
+            l_ij = tl.sum(p, axis=1)
+            acc_ij = tl.dot(p, v)
+
+            m_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_new)
+            beta = tl.where(m_ij_is_inf, 0.0, tl.exp(m_ij - m_new))
+
+            l_i = l_i * alpha + l_ij * beta
+            acc = acc * alpha[:, None] + acc_ij * beta[:, None]
+            m_i = m_new
+
+        acc = acc / l_i[:, None]
+
+        o_ptrs = (
+            o_ptr
+            + batch_id * stride_oz
+            + head_id * stride_oh
+            + offs_m[:, None] * stride_om
+            + offs_k[None, :] * stride_ok
+        )
+        store_mask = (offs_m[:, None] < seqlen) & (offs_k[None, :] < head_dim)
+        tl.store(o_ptrs, acc, mask=store_mask)
+
+
+def _flash_attention_triton(query, key, value, scale):
+    batch, n_heads, seq_len, head_dim = query.shape
+
+    q = query.contiguous()
+    k = key.contiguous()
+    v = value.contiguous()
+
+    o = torch.empty_like(q)
+
+    BLOCK_M = 128 if seq_len <= 128 else 64
+    BLOCK_N = 128 if seq_len <= 128 else 64
+    block_d = int(triton.next_power_of_2(head_dim))
+
+    grid = (triton.cdiv(seq_len, BLOCK_M), batch * n_heads)
+
+    _flash_attn_fwd[grid](
+        q,
+        k,
+        v,
+        o,
+        scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        o.stride(3),
+        n_heads,
+        seq_len,
+        head_dim,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_DMODEL=block_d,
+    )
+
+    return o
+
+
 def apply_scaled_dot_product_attention(query, key, value):
     _, num_heads_q, seq_len_q, emb_dim = query.shape
     _, num_heads_k, seq_len_k, _ = key.shape
@@ -84,6 +307,13 @@ def apply_scaled_dot_product_attention(query, key, value):
     value = value.repeat_interleave(num_heads_q // num_heads_v, 1)
 
     scale = 1 / math.sqrt(emb_dim)
+
+    if _triton_available and query.is_cuda and os.environ.get("USE_TRITON_ATTENTION", "1") != "0":
+        try:
+            return _flash_attention_triton(query, key, value, scale)
+        except RuntimeError:
+            pass
+
     attn_mask = torch.tril(
         torch.full((seq_len_q, seq_len_k), True, device=query.device)
     )

@@ -54,6 +54,9 @@ if __name__ == "__main__":
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     inputs = tokenizer(prompts, padding=True, return_tensors="pt").to(device)
 
     model = llama.ModelForCausalLM.from_pretrained(model_path).to(device)
