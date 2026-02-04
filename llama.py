@@ -58,6 +58,71 @@ if _triton_available:
         tl.store(o_ptr + offsets, y, mask=mask)
 
 
+    @triton.jit
+    def _silu_mul_down_kernel(
+        gate_ptr,
+        up_ptr,
+        w_ptr,
+        o_ptr,
+        stride_gm,
+        stride_gk,
+        stride_um,
+        stride_uk,
+        stride_wk,
+        stride_wn,
+        stride_om,
+        stride_on,
+        M,
+        K,
+        N,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for k in range(0, tl.cdiv(K, BLOCK_K)):
+            k_start = k * BLOCK_K
+            k_mask = k_start + offs_k < K
+
+            gate_block = tl.load(
+                gate_ptr + offs_m[:, None] * stride_gm + (k_start + offs_k)[None, :] * stride_gk,
+                mask=(offs_m[:, None] < M) & k_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+
+            up_block = tl.load(
+                up_ptr + offs_m[:, None] * stride_um + (k_start + offs_k)[None, :] * stride_uk,
+                mask=(offs_m[:, None] < M) & k_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+
+            act = gate_block * (1.0 / (1.0 + tl.exp(-gate_block))) * up_block
+
+            w_block = tl.load(
+                w_ptr + (k_start + offs_k)[:, None] * stride_wk + offs_n[None, :] * stride_wn,
+                mask=k_mask[:, None] & (offs_n[None, :] < N),
+                other=0.0,
+            ).to(tl.float32)
+
+            acc += tl.dot(act, w_block)
+
+        acc = acc.to(tl.float16)
+
+        tl.store(
+            o_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on,
+            acc,
+            mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+        )
+
+
 def _rms_norm_triton(input, weight, eps):
     hidden_size = input.shape[-1]
     x_2d = input.view(-1, hidden_size)
@@ -86,6 +151,56 @@ def _rms_norm_triton(input, weight, eps):
     )
 
     return output.view_as(input)
+
+
+def _swi_glu_down_triton(gate, up, down_weight):
+    # gate/up: [B,S,Inter], down_weight: [Hidden, Inter]
+    M = gate.numel() // gate.shape[-1]
+    K = gate.shape[-1]
+
+    w = down_weight.t()
+    N = w.shape[1]
+
+    gate_2d = gate.reshape(M, K)
+    up_2d = up.reshape(M, K)
+
+    if not gate_2d.is_contiguous():
+        gate_2d = gate_2d.contiguous()
+    if not up_2d.is_contiguous():
+        up_2d = up_2d.contiguous()
+    if not w.is_contiguous():
+        w = w.contiguous()
+
+    out = torch.empty((M, N), device=gate.device, dtype=gate.dtype)
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 64
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    _silu_mul_down_kernel[grid](
+        gate_2d,
+        up_2d,
+        w,
+        out,
+        gate_2d.stride(0),
+        gate_2d.stride(1),
+        up_2d.stride(0),
+        up_2d.stride(1),
+        w.stride(0),
+        w.stride(1),
+        out.stride(0),
+        out.stride(1),
+        M,
+        K,
+        N,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+    )
+
+    return out.view_as(gate.new_empty((*gate.shape[:-1], N)))
 
 
 class RMSNorm(nn.Module):
@@ -120,7 +235,13 @@ class MLP(nn.Module):
         self.silu = nn.SiLU()
 
     def forward(self, input):
-        return self.down_proj(self.silu(self.gate_proj(input)) * self.up_proj(input))
+        gate = self.gate_proj(input)
+        up = self.up_proj(input)
+
+        if _triton_available and input.is_cuda:
+            return _swi_glu_down_triton(gate, up, self.down_proj.weight)
+
+        return self.down_proj(self.silu(gate) * up)
 
 
 def apply_rotary_position_embedding(input, sin_table, cos_table):
