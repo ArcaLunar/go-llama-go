@@ -245,6 +245,9 @@ class MLP(nn.Module):
 
 
 def apply_rotary_position_embedding(input, sin_table, cos_table):
+    if _triton_available and input.is_cuda and os.environ.get("USE_TRITON_ROPE", "1") != "0":
+        return _apply_rope_triton(input, sin_table, cos_table)
+
     sin_table = sin_table[None, :, None, :]
     cos_table = cos_table[None, :, None, :]
 
@@ -371,6 +374,73 @@ if _triton_available:
         tl.store(o_ptrs, acc, mask=store_mask)
 
 
+    @triton.jit
+    def _rope_kernel_flat(
+        x_ptr,
+        sin_ptr,
+        cos_ptr,
+        o_ptr,
+        stride_xm,
+        stride_xd,
+        stride_sm,
+        stride_sd,
+        total_rows,
+        seqlen,
+        n_heads,
+        head_dim,
+        BLOCK_M: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+
+        offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        row_mask = offs_m < total_rows
+
+        offs_d = tl.arange(0, BLOCK_D)
+        half_d = head_dim // 2
+        d_mask = offs_d < half_d
+
+        # Map row -> (b, s, h)
+        rows = offs_m
+        s_idx = (rows // n_heads) % seqlen
+
+        first = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + offs_d[None, :] * stride_xd,
+            mask=row_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        second = tl.load(
+            x_ptr + offs_m[:, None] * stride_xm + (offs_d + half_d)[None, :] * stride_xd,
+            mask=row_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        sin = tl.load(
+            sin_ptr + s_idx[:, None] * stride_sm + offs_d[None, :] * stride_sd,
+            mask=row_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        cos = tl.load(
+            cos_ptr + s_idx[:, None] * stride_sm + offs_d[None, :] * stride_sd,
+            mask=row_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        out_first = first * cos - second * sin
+        out_second = first * sin + second * cos
+
+        tl.store(
+            o_ptr + offs_m[:, None] * stride_xm + offs_d[None, :] * stride_xd,
+            out_first,
+            mask=row_mask[:, None] & d_mask[None, :],
+        )
+        tl.store(
+            o_ptr + offs_m[:, None] * stride_xm + (offs_d + half_d)[None, :] * stride_xd,
+            out_second,
+            mask=row_mask[:, None] & d_mask[None, :],
+        )
+
+
 def _flash_attention_triton(query, key, value, scale):
     batch, n_heads, seq_len, head_dim = query.shape
 
@@ -417,6 +487,46 @@ def _flash_attention_triton(query, key, value, scale):
     )
 
     return o
+
+
+def _apply_rope_triton(x, sin_table, cos_table):
+    # x: [B, S, H, D]
+    bsz, seqlen, n_heads, head_dim = x.shape
+
+    assert head_dim % 2 == 0
+
+    x_c = x.contiguous()
+    sin_c = sin_table.contiguous()
+    cos_c = cos_table.contiguous()
+
+    flat = x_c.view(-1, head_dim)
+    out = torch.empty_like(flat)
+
+    BLOCK_M = 128
+    BLOCK_D = min(128, head_dim)
+
+    total_rows = flat.shape[0]
+
+    grid = (triton.cdiv(total_rows, BLOCK_M),)
+
+    _rope_kernel_flat[grid](
+        flat,
+        sin_c,
+        cos_c,
+        out,
+        flat.stride(0),
+        flat.stride(1),
+        sin_c.stride(0),
+        sin_c.stride(1),
+        total_rows,
+        seqlen,
+        n_heads,
+        head_dim,
+        BLOCK_M=BLOCK_M,
+        BLOCK_D=BLOCK_D // 2,
+    )
+
+    return out.view_as(x_c)
 
 
 def apply_scaled_dot_product_attention(query, key, value):
